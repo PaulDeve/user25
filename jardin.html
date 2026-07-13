@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Jardín — Pradera de Primavera</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #cfe3e8;
+    cursor: crosshair;
+    font-family: Georgia, 'Times New Roman', serif;
+  }
+  #scene { display: block; width: 100vw; height: 100vh; }
+  #hint {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    color: rgba(255,255,255,0.85); font-size: 13px; letter-spacing: 0.5px;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.55);
+    pointer-events: none; opacity: 1; transition: opacity 2s ease;
+  }
+  #hint.hide { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="hint">mueve el ratón entre las flores · haz clic para plantar una nueva</div>
+<script>
+(function(){
+"use strict";
+
+/* ============================================================
+   CANVAS SETUP
+   ============================================================ */
+const canvas = document.getElementById('scene');
+const ctx = canvas.getContext('2d', { alpha:false });
+let W, H, DPR;
+
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W*DPR; canvas.height = H*DPR;
+  canvas.style.width = W+'px'; canvas.style.height = H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  horizonY = H*0.52;
+}
+let horizonY = 0;
+window.addEventListener('resize', resize);
+
+/* ============================================================
+   UTILITIES
+   ============================================================ */
+function rand(a,b){ return a + Math.random()*(b-a); }
+function randInt(a,b){ return Math.floor(rand(a,b+1)); }
+function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+function lerp(a,b,t){ return a + (b-a)*t; }
+function pick(arr){ return arr[randInt(0,arr.length-1)]; }
+
+// cheap smooth pseudo-noise via layered sines (no perlin needed, stays natural)
+function noise1(x){
+  return Math.sin(x*1.0) * 0.5 + Math.sin(x*2.13+1.7)*0.3 + Math.sin(x*4.07+3.1)*0.2;
+}
+
+/* ============================================================
+   TIME / WIND
+   ============================================================ */
+let t = 0;          // global seconds
+let windTime = 0;
+let windBase = 0.55;
+let gust = 0;        // extra gust strength
+let gustTarget = 0;
+function updateWind(dt){
+  windTime += dt;
+  if (Math.random() < 0.003) gustTarget = rand(0.3, 1.3);
+  gust = lerp(gust, gustTarget, dt*0.6);
+  gustTarget *= 0.995;
+}
+function windStrength(){
+  return windBase + gust + noise1(windTime*0.15)*0.25;
+}
+function windAt(x, depth){
+  // depth in [0,1], farther things sway a bit less crisply but similar amplitude
+  const w = windStrength();
+  return Math.sin(windTime*1.1 + x*0.01) * w * (0.6+0.4*depth)
+       + Math.sin(windTime*2.3 + x*0.02 + 1.3) * w * 0.35;
+}
+
+/* ============================================================
+   MOUSE
+   ============================================================ */
+const mouse = { x: -9999, y: -9999, active:false, vx:0, vy:0, px:0, py:0 };
+window.addEventListener('mousemove', e=>{
+  mouse.px = mouse.x; mouse.py = mouse.y;
+  mouse.x = e.clientX; mouse.y = e.clientY;
+  mouse.vx = mouse.x-mouse.px; mouse.vy = mouse.y-mouse.py;
+  mouse.active = true;
+});
+window.addEventListener('mouseleave', ()=>{ mouse.active=false; });
+canvas.addEventListener('click', e=>{
+  spawnGrownFlower(e.clientX, e.clientY);
+  const hint = document.getElementById('hint');
+  hint.classList.add('hide');
+});
+
+function mouseInfluence(x,y,radius){
+  if (!mouse.active) return 0;
+  const dx = x-mouse.x, dy = y-mouse.y;
+  const d = Math.sqrt(dx*dx+dy*dy);
+  if (d > radius) return 0;
+  return (1 - d/radius);
+}
+
+/* ============================================================
+   PALETTE  — natural spring meadow, no neon, pastel + earthy
+   ============================================================ */
+const FLOWER_HUES = [
+  {h:[300,330], s:[35,55], l:[55,72]},   // soft pink / magenta wild
+  {h:[45,55],   s:[70,90], l:[52,62]},   // buttercup yellow
+  {h:[0,10],    s:[55,75], l:[42,55]},   // poppy red
+  {h:[255,275], s:[30,50], l:[55,70]},   // lavender / violet
+  {h:[205,225], s:[35,55], l:[55,68]},   // cornflower blue
+  {h:[20,35],   s:[60,80], l:[55,65]},   // marigold orange
+  {h:[0,0],     s:[0,5],   l:[92,98]},   // daisy white
+];
+
+function flowerColor(){
+  const g = pick(FLOWER_HUES);
+  const h = rand(g.h[0], g.h[1]);
+  const s = rand(g.s[0], g.s[1]);
+  const l = rand(g.l[0], g.l[1]);
+  return {h,s,l};
+}
+
+const STEM_GREEN = ()=> `hsl(${rand(85,110)}, ${rand(28,45)}%, ${rand(24,34)}%)`;
+const GRASS_GREEN = ()=> `hsl(${rand(80,108)}, ${rand(32,48)}%, ${rand(26,40)}%)`;
+
+/* ============================================================
+   SKY : gradient + clouds + sun + rays + mist
+   ============================================================ */
+const clouds = [];
+for (let i=0;i<9;i++){
+  clouds.push({
+    x: rand(0,1), y: rand(0.03,0.30), // normalized
+    scale: rand(0.6,1.6),
+    speed: rand(2,6),
+    puffs: (()=>{
+      const n = randInt(4,7); const arr=[];
+      for(let p=0;p<n;p++){
+        arr.push({ox: rand(-70,70), oy: rand(-14,14), r: rand(24,52)});
+      }
+      return arr;
+    })()
+  });
+}
+
+let lightPhase = 0; // slow oscillation of overall brightness/warmth
+function updateLight(dt){ lightPhase += dt*0.02; }
+
+function skyColors(){
+  const warm = (Math.sin(lightPhase)+1)/2; // 0..1
+  const top = `hsl(${lerp(206,200,warm)}, ${lerp(55,45,warm)}%, ${lerp(58,66,warm)}%)`;
+  const mid = `hsl(${lerp(46,40,warm)}, ${lerp(55,65,warm)}%, ${lerp(78,84,warm)}%)`;
+  const horizon = `hsl(${lerp(38,30,warm)}, ${lerp(45,60,warm)}%, ${lerp(86,90,warm)}%)`;
+  return {top, mid, horizon, warm};
+}
+
+function drawSky(){
+  const {top, mid, horizon} = skyColors();
+  let g = ctx.createLinearGradient(0,0,0,horizonY+40);
+  g.addColorStop(0, top);
+  g.addColorStop(0.55, mid);
+  g.addColorStop(1, horizon);
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,horizonY+40);
+
+  // sun glow
+  const sunX = W*0.78, sunY = horizonY*0.28;
+  let sg = ctx.createRadialGradient(sunX,sunY,0, sunX,sunY, W*0.55);
+  sg.addColorStop(0, 'rgba(255,250,225,0.55)');
+  sg.addColorStop(0.15, 'rgba(255,244,200,0.28)');
+  sg.addColorStop(1, 'rgba(255,244,200,0)');
+  ctx.fillStyle = sg;
+  ctx.fillRect(0,0,W,horizonY+40);
+
+  // faint god rays
+  ctx.save();
+  ctx.globalAlpha = 0.10 + 0.03*Math.sin(t*0.15);
+  ctx.translate(sunX, sunY);
+  ctx.rotate(Math.sin(t*0.02)*0.05);
+  for (let i=0;i<5;i++){
+    const a = -0.5 + i*0.28;
+    ctx.save();
+    ctx.rotate(a);
+    const rg = ctx.createLinearGradient(0,0,0,H*1.1);
+    rg.addColorStop(0,'rgba(255,250,230,0.5)');
+    rg.addColorStop(1,'rgba(255,250,230,0)');
+    ctx.fillStyle = rg;
+    ctx.beginPath();
+    ctx.moveTo(-14,0); ctx.lineTo(14,0); ctx.lineTo(90,H*1.1); ctx.lineTo(-90,H*1.1);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+
+  // clouds
+  clouds.forEach(c=>{
+    c.x += (c.speed*0.00002);
+    if (c.x > 1.3) c.x = -0.3;
+    const cx = c.x*W, cy = c.y*H;
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    c.puffs.forEach(p=>{
+      const px = cx + p.ox*c.scale, py = cy + p.oy*c.scale, pr = p.r*c.scale;
+      const grad = ctx.createRadialGradient(px,py,0, px,py, pr);
+      grad.addColorStop(0,'rgba(255,255,255,0.9)');
+      grad.addColorStop(1,'rgba(255,255,255,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(px,py,pr,0,Math.PI*2); ctx.fill();
+    });
+    ctx.restore();
+  });
+
+  // mist near horizon
+  let mg = ctx.createLinearGradient(0, horizonY-90, 0, horizonY+30);
+  mg.addColorStop(0,'rgba(255,255,255,0)');
+  mg.addColorStop(1,'rgba(255,255,255,0.55)');
+  ctx.fillStyle = mg;
+  ctx.fillRect(0, horizonY-90, W, 120);
+}
+
+/* ============================================================
+   MOUNTAINS (far parallax layer)
+   ============================================================ */
+let mountainPts = null;
+function buildMountains(){
+  mountainPts = [];
+  const n = 10;
+  for (let i=0;i<=n;i++){
+    mountainPts.push(rand(0.06,0.16));
+  }
+}
+function drawMountains(parX){
+  if (!mountainPts) buildMountains();
+  const baseY = horizonY;
+  ctx.save();
+  ctx.fillStyle = 'hsla(220, 25%, 62%, 0.55)';
+  ctx.beginPath();
+  ctx.moveTo(-50+parX, baseY);
+  const n = mountainPts.length-1;
+  for (let i=0;i<=n;i++){
+    const x = -50+parX + (W+100)*(i/n);
+    const y = baseY - mountainPts[i]*H;
+    ctx.lineTo(x,y);
+  }
+  ctx.lineTo(W+50+parX, baseY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+/* ============================================================
+   BACKGROUND TREES & BUSHES (parallax)
+   ============================================================ */
+const trees = [];
+function buildTrees(){
+  trees.length = 0;
+  const n = 8;
+  for (let i=0;i<n;i++){
+    trees.push({
+      x: (i/(n-1)) * (W*1.15) - W*0.075 + rand(-30,30),
+      h: rand(60,120),
+      w: rand(50,100),
+      hue: rand(95,120),
+      phase: rand(0,10)
+    });
+  }
+}
+function drawTrees(parX){
+  trees.forEach(tr=>{
+    const x = tr.x + parX;
+    const y = horizonY;
+    const sway = windAt(x,0.3)*3;
+    ctx.save();
+    ctx.translate(x + sway, y);
+    ctx.fillStyle = `hsla(${tr.hue}, 30%, 26%, 0.75)`;
+    ctx.beginPath();
+    ctx.ellipse(0, -tr.h*0.55, tr.w*0.5, tr.h*0.5, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(tr.w*0.3, -tr.h*0.35, tr.w*0.32, tr.h*0.32, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(-tr.w*0.28, -tr.h*0.4, tr.w*0.3, tr.h*0.3, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  });
+}
+
+/* ============================================================
+   GROUND
+   ============================================================ */
+function drawGround(){
+  let g = ctx.createLinearGradient(0, horizonY, 0, H);
+  const {warm} = skyColors();
+  g.addColorStop(0, `hsl(${lerp(95,88,warm)}, 32%, 34%)`);
+  g.addColorStop(0.4, `hsl(${lerp(92,85,warm)}, 34%, 26%)`);
+  g.addColorStop(1, `hsl(${lerp(88,80,warm)}, 30%, 16%)`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, horizonY-4, W, H-horizonY+4);
+}
+
+/* ============================================================
+   DEPTH → SCREEN helpers (simple perspective banding)
+   depth: 0 = far (near horizon), 1 = near (bottom of screen)
+   ============================================================ */
+function depthToY(depth){
+  return horizonY + (H-horizonY) * Math.pow(depth, 1.15);
+}
+function depthScale(depth){
+  return lerp(0.35, 1.25, depth);
+}
+
+/* ============================================================
+   GRASS BLADES
+   ============================================================ */
+const grassBlades = [];
+function buildGrass(){
+  grassBlades.length = 0;
+  const count = 900;
+  for (let i=0;i<count;i++){
+    const depth = Math.pow(Math.random(), 0.6); // more near ones
+    const x = rand(-40, W+40);
+    grassBlades.push({
+      x, depth,
+      y: depthToY(depth) + rand(-6,10),
+      h: rand(10,26) * depthScale(depth),
+      w: rand(1.4,3.2) * depthScale(depth),
+      lean: rand(-0.15,0.15),
+      phase: rand(0,10),
+      color: GRASS_GREEN()
+    });
+  }
+  grassBlades.sort((a,b)=>a.depth-b.depth);
+}
+
+function drawGrassBlade(b){
+  const w = windAt(b.x, b.depth) * (0.5+0.5*b.depth);
+  const mInf = mouseInfluence(b.x, b.y, 130*depthScale(b.depth));
+  const mDir = mInf * clamp(mouse.vx*0.05, -1, 1);
+  const bend = b.lean + w*0.4 + mInf*0.5 + mDir*0.3 + Math.sin(windTime*1.7+b.phase)*0.06;
+  const topX = b.x + bend*b.h;
+  const topY = b.y - b.h;
+  ctx.strokeStyle = b.color;
+  ctx.lineWidth = b.w;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(b.x, b.y);
+  ctx.quadraticCurveTo(b.x + bend*b.h*0.5, b.y - b.h*0.55, topX, topY);
+  ctx.stroke();
+}
+
+/* ============================================================
+   PETAL SHAPES — a small library, chosen per-flower for variety
+   Each function draws ONE petal centered at origin, pointing +y (outward),
+   length L, width Wd, with local ctx transform already applied by caller.
+   ============================================================ */
+const petalShapes = {
+  round(ctx,L,Wd){
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.bezierCurveTo(-Wd*0.55, L*0.35, -Wd*0.4, L*0.95, 0, L);
+    ctx.bezierCurveTo(Wd*0.4, L*0.95, Wd*0.55, L*0.35, 0, 0);
+    ctx.closePath();
+  },
+  pointed(ctx,L,Wd){
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.quadraticCurveTo(-Wd*0.5, L*0.5, 0, L);
+    ctx.quadraticCurveTo(Wd*0.5, L*0.5, 0, 0);
+    ctx.closePath();
+  },
+  ruffled(ctx,L,Wd){
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.bezierCurveTo(-Wd*0.6, L*0.25, -Wd*0.7, L*0.6, -Wd*0.15, L*0.8);
+    ctx.bezierCurveTo(-Wd*0.35, L*0.92, Wd*0.1, L, 0, L);
+    ctx.bezierCurveTo(-Wd*0.1, L, Wd*0.35, L*0.92, Wd*0.15, L*0.8);
+    ctx.bezierCurveTo(Wd*0.7, L*0.6, Wd*0.6, L*0.25, 0, 0);
+    ctx.closePath();
+  },
+  elongated(ctx,L,Wd){
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.bezierCurveTo(-Wd*0.35, L*0.4, -Wd*0.3, L*1.05, 0, L*1.15);
+    ctx.bezierCurveTo(Wd*0.3, L*1.05, Wd*0.35, L*0.4, 0, 0);
+    ctx.closePath();
+  },
+  bell(ctx,L,Wd){
+    ctx.beginPath();
+    ctx.moveTo(-Wd*0.5,0);
+    ctx.quadraticCurveTo(-Wd*0.65, L*0.6, 0, L);
+    ctx.quadraticCurveTo(Wd*0.65, L*0.6, Wd*0.5, 0);
+    ctx.closePath();
+  },
+  daisy(ctx,L,Wd){
+    ctx.beginPath();
+    ctx.moveTo(-Wd*0.28,0);
+    ctx.lineTo(-Wd*0.22, L*0.85);
+    ctx.quadraticCurveTo(0, L*1.05, Wd*0.22, L*0.85);
+    ctx.lineTo(Wd*0.28,0);
+    ctx.closePath();
+  }
+};
+const petalShapeKeys = Object.keys(petalShapes);
+
+/* ============================================================
+   FLOWER FACTORY
+   ============================================================ */
+let flowerSerial = 0;
+function makeFlowerSpec(x, depth, growingFromClick){
+  const col = flowerColor();
+  return {
+    id: ++flowerSerial,
+    x,
+    depth,
+    growing: !!growingFromClick,
+    growProgress: growingFromClick ? 0 : 1,
+    growSpeed: 1/rand(2.6,3.4), // ~3s total
+    stemHeight: rand(30,70) * depthScale(depth),
+    stemThickness: rand(1.6,3.4) * depthScale(depth),
+    stemCurve: rand(-0.2,0.2),
+    petalCount: randInt(5,13),
+    petalShape: pick(petalShapeKeys),
+    petalLen: rand(10,22) * depthScale(depth),
+    petalWidth: rand(5,12) * depthScale(depth),
+    hue: col.h, sat: col.s, lig: col.l,
+    centerHue: rand(35,50), centerSat: rand(70,90), centerLig: rand(45,58),
+    headSize: rand(0.85,1.25),
+    orientation: rand(0, Math.PI*2),
+    openness: growingFromClick ? 0 : rand(0.85,1),
+    tilt: rand(-0.35,0.35),
+    swayPhase: rand(0,10),
+    leaves: (()=>{
+      const n = randInt(1,3); const arr=[];
+      for (let i=0;i<n;i++){
+        arr.push({ t: rand(0.25,0.75), side: Math.random()<0.5?-1:1, len: rand(8,16)*depthScale(depth), phase: rand(0,10) });
+      }
+      return arr;
+    })(),
+    y: depthToY(depth) + rand(-4,6)
+  };
+}
+
+const flowers = [];
+function buildFlowerField(){
+  flowers.length = 0;
+  const count = 130;
+  for (let i=0;i<count;i++){
+    const depth = Math.pow(Math.random(), 0.65);
+    const x = rand(-30, W+30);
+    flowers.push(makeFlowerSpec(x, depth, false));
+  }
+  flowers.sort((a,b)=>a.depth-b.depth);
+}
+
+function spawnGrownFlower(px, py){
+  // approximate depth from click y position
+  const depth = clamp((py - horizonY) / (H - horizonY), 0.08, 1);
+  const f = makeFlowerSpec(px, depth, true);
+  f.y = py;
+  flowers.push(f);
+}
+
+/* ============================================================
+   DRAW A SINGLE FLOWER (stem, leaves, head) with wind + growth + mouse
+   ============================================================ */
+function drawFlower(f, dt){
+  if (f.growing){
+    f.growProgress = clamp(f.growProgress + dt*f.growSpeed, 0, 1);
+    if (f.growProgress >= 1) f.growing = false;
+  }
+  const gp = f.growProgress;
+  // growth stages: 0-0.25 sprout, 0.25-0.6 stem+leaves, 0.6-0.85 bud, 0.85-1 bloom
+  const stemT = clamp(gp/0.6, 0, 1);
+  const leafT = clamp((gp-0.2)/0.4, 0, 1);
+  const budT  = clamp((gp-0.55)/0.3, 0, 1);
+  const bloomT = clamp((gp-0.75)/0.25, 0, 1);
+  const openness = f.growing ? bloomT : f.openness;
+
+  const w = windAt(f.x, f.depth);
+  const mInf = mouseInfluence(f.x, f.y, 150*depthScale(f.depth));
+  const mDir = clamp(mouse.vx*0.04,-1,1);
+  const sway = f.stemCurve + w*0.5*(0.4+0.6*f.depth) + mInf*0.6 + mDir*mInf*0.4
+             + Math.sin(windTime*1.4+f.swayPhase)*0.08;
+
+  const baseX = f.x, baseY = f.y;
+  const h = f.stemHeight * stemT;
+  const topX = baseX + sway*h;
+  const topY = baseY - h;
+  const midX = baseX + sway*h*0.45;
+  const midY = baseY - h*0.5;
+
+  if (h > 0.5){
+    ctx.strokeStyle = STEM_GREEN_CACHE(f);
+    ctx.lineWidth = f.stemThickness;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(baseX, baseY);
+    ctx.quadraticCurveTo(midX, midY, topX, topY);
+    ctx.stroke();
+  }
+
+  // leaves along stem
+  if (leafT > 0){
+    f.leaves.forEach(lf=>{
+      if (lf.t > stemT+0.05) return;
+      const along = lf.t;
+      const lx = lerp(baseX, topX, along);
+      const ly = lerp(baseY, topY, along);
+      const leafSway = Math.sin(windTime*1.9 + lf.phase)* (0.3+0.5*w);
+      const ang = lf.side*(0.9+leafSway*0.3) + sway*0.5;
+      const scale = Math.min(1, leafT*1.4);
+      ctx.save();
+      ctx.translate(lx,ly);
+      ctx.rotate(ang);
+      ctx.fillStyle = f.leafColor || (f.leafColor = STEM_GREEN());
+      ctx.beginPath();
+      ctx.moveTo(0,0);
+      ctx.quadraticCurveTo(lf.len*0.5*scale, -lf.len*0.25*scale, lf.len*scale, 0);
+      ctx.quadraticCurveTo(lf.len*0.5*scale, lf.len*0.25*scale, 0, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    });
+  }
+
+  // flower head
+  if (budT <= 0) return;
+  ctx.save();
+  ctx.translate(topX, topY);
+  const headWobble = Math.sin(windTime*2.1+f.swayPhase)*0.12*(0.3+w);
+  ctx.rotate(f.orientation + sway*0.6 + f.tilt + headWobble);
+  const size = f.headSize * (0.35 + 0.65*budT) * depthScale(f.depth);
+
+  // bud (closed) rendering when openness small
+  const openF = f.growing ? openness : openness;
+  if (openF < 0.98){
+    ctx.save();
+    ctx.scale(size,size);
+    ctx.fillStyle = `hsl(${f.hue}, ${f.sat*0.7}%, ${clamp(f.lig-8,10,90)}%)`;
+    ctx.beginPath();
+    ctx.ellipse(0, -6*(0.4+0.6*openF), 6*(1-openF*0.3), 9*(1-openF*0.2), 0,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  if (openF > 0.05){
+    const shapeFn = petalShapes[f.petalShape];
+    const n = f.petalCount;
+    for (let i=0;i<n;i++){
+      const baseAng = (i/n)*Math.PI*2;
+      const petalFlutter = Math.sin(windTime*2.6 + f.swayPhase + i)*0.08*(0.4+w);
+      const spread = lerp(0.15, 1, openF); // petals fan outward as flower opens
+      ctx.save();
+      ctx.rotate(baseAng + petalFlutter*0.3);
+      ctx.scale(size, size);
+      ctx.translate(0, - (1-spread)*2);
+      ctx.rotate(petalFlutter);
+      const l = f.petalLen*(0.5+0.5*spread);
+      const wd = f.petalWidth;
+      const grad = ctx.createLinearGradient(0,0,0,l);
+      grad.addColorStop(0, `hsl(${f.hue}, ${f.sat}%, ${clamp(f.lig-10,5,95)}%)`);
+      grad.addColorStop(1, `hsl(${f.hue+rand(-4,4)}, ${f.sat}%, ${clamp(f.lig+6,5,97)}%)`);
+      ctx.fillStyle = grad;
+      shapeFn(ctx, l, wd);
+      ctx.fill();
+      ctx.restore();
+    }
+    // center disc
+    ctx.save();
+    ctx.scale(size,size);
+    ctx.fillStyle = `hsl(${f.centerHue}, ${f.centerSat}%, ${f.centerLig}%)`;
+    ctx.beginPath();
+    ctx.arc(0,0, 3.4+ n*0.05, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+function STEM_GREEN_CACHE(f){
+  if (!f.stemColor) f.stemColor = STEM_GREEN();
+  return f.stemColor;
+}
+
+/* ============================================================
+   BUTTERFLIES
+   ============================================================ */
+const butterflies = [];
+function buildButterflies(){
+  butterflies.length = 0;
+  const n = 6;
+  for (let i=0;i<n;i++){
+    butterflies.push({
+      x: rand(0,W), y: rand(horizonY*0.6, H*0.7),
+      vx: rand(-20,20), vy: rand(-10,10),
+      wingPhase: rand(0,10),
+      hue: pick([45,340,20,270,0]),
+      dir: rand(0,Math.PI*2),
+      wander: rand(0,10)
+    });
+  }
+}
+function updateDrawButterfly(b, dt){
+  b.wander += dt;
+  b.dir += Math.sin(b.wander*0.8)*0.03;
+  let tvx = Math.cos(b.dir)*26, tvy = Math.sin(b.dir)*14 - 6;
+  const mInf = mouseInfluence(b.x,b.y,140);
+  if (mInf>0){
+    const ang = Math.atan2(b.y-mouse.y, b.x-mouse.x);
+    tvx += Math.cos(ang)*60*mInf;
+    tvy += Math.sin(ang)*60*mInf;
+  }
+  b.vx = lerp(b.vx, tvx, dt*1.2);
+  b.vy = lerp(b.vy, tvy, dt*1.2);
+  b.x += b.vx*dt; b.y += b.vy*dt;
+  if (b.x<-30) b.x=W+30; if (b.x>W+30) b.x=-30;
+  b.y = clamp(b.y, horizonY*0.3, H*0.85);
+  b.wingPhase += dt*14;
+
+  ctx.save();
+  ctx.translate(b.x,b.y);
+  ctx.rotate(Math.atan2(b.vy,b.vx)*0.3);
+  const flap = Math.sin(b.wingPhase);
+  ctx.fillStyle = `hsla(${b.hue}, 70%, 60%, 0.9)`;
+  for (const s of [-1,1]){
+    ctx.save();
+    ctx.scale(s,1);
+    ctx.rotate(-flap*0.9-0.2);
+    ctx.beginPath();
+    ctx.ellipse(6,0, 8,5,0,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle = 'rgba(30,25,20,0.85)';
+  ctx.beginPath(); ctx.ellipse(0,0,1.4,4,0,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+/* ============================================================
+   BEES
+   ============================================================ */
+const bees = [];
+function buildBees(){
+  bees.length = 0;
+  for (let i=0;i<4;i++){
+    bees.push({ x: rand(0,W), y: rand(H*0.5,H*0.8), target:null, wingPhase: rand(0,10), state:'fly', timer: rand(1,3) });
+  }
+}
+function pickFlowerTarget(){
+  const near = flowers.filter(f=>f.depth>0.4);
+  if (!near.length) return null;
+  return pick(near);
+}
+function updateDrawBee(b, dt){
+  b.wingPhase += dt*40;
+  b.timer -= dt;
+  if (!b.target || b.timer<=0){
+    if (b.state==='hover' ){ b.state='fly'; b.timer=rand(1.5,3); b.target=pickFlowerTarget(); }
+    else if (!b.target){ b.target = pickFlowerTarget(); b.timer = rand(1.5,3);}
+  }
+  let tx=b.x, ty=b.y-30;
+  if (b.target){
+    tx = b.target.x; ty = b.target.y - b.target.stemHeight - 10;
+    const d = Math.hypot(b.x-tx,b.y-ty);
+    if (d<14 && b.state==='fly'){ b.state='hover'; b.timer=rand(0.8,1.6); }
+  }
+  const speed = b.state==='hover' ? 0.6 : 2.2;
+  b.x = lerp(b.x, tx + Math.sin(t*3+b.wingPhase)*6, dt*speed);
+  b.y = lerp(b.y, ty + Math.cos(t*4)*3, dt*speed);
+
+  ctx.save();
+  ctx.translate(b.x,b.y);
+  const flap = Math.sin(b.wingPhase)*0.6;
+  ctx.fillStyle='rgba(255,255,255,0.5)';
+  ctx.beginPath(); ctx.ellipse(-2,-4+flap,5,3,0.3,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(4,-4-flap,5,3,-0.3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#3a2a12';
+  ctx.beginPath(); ctx.ellipse(0,0,4,3,0,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#f4c430'; ctx.lineWidth=1.6;
+  ctx.beginPath(); ctx.moveTo(-3,-1); ctx.lineTo(3,-1); ctx.moveTo(-3,1); ctx.lineTo(3,1); ctx.stroke();
+  ctx.restore();
+}
+
+/* ============================================================
+   DRAGONFLIES (occasional)
+   ============================================================ */
+let dragonflies = [];
+function maybeSpawnDragonfly(){
+  if (dragonflies.length<1 && Math.random()<0.0025){
+    dragonflies.push({ x:-30, y: rand(H*0.35,H*0.6), vx: rand(90,150), vy:0, phase:0, life: rand(6,10) });
+  }
+}
+function updateDrawDragonfly(d, dt){
+  d.phase += dt*6;
+  d.vy = Math.sin(d.phase)*40;
+  d.x += d.vx*dt; d.y += d.vy*dt*0.3;
+  d.life -= dt;
+  ctx.save();
+  ctx.translate(d.x,d.y);
+  ctx.rotate(Math.atan2(d.vy,d.vx)*0.4);
+  ctx.strokeStyle='rgba(40,90,90,0.85)';
+  ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(-14,0); ctx.lineTo(10,0); ctx.stroke();
+  ctx.fillStyle='rgba(180,230,220,0.55)';
+  const wf = Math.sin(d.phase*4)*0.4;
+  for (const s of [-1,1]) for (const o of [-4,3]){
+    ctx.save(); ctx.translate(o, s*2);
+    ctx.rotate(s*0.5+wf);
+    ctx.beginPath(); ctx.ellipse(6,0,9,2.4,0,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+/* ============================================================
+   GROUND INSECTS (ants / beetles walking)
+   ============================================================ */
+const groundBugs = [];
+function buildGroundBugs(){
+  groundBugs.length=0;
+  for (let i=0;i<10;i++){
+    groundBugs.push({ x: rand(0,W), y: rand(H*0.75,H*0.97), dir: rand(0,Math.PI*2), speed: rand(6,14), turnT: rand(0.5,2) });
+  }
+}
+function updateDrawGroundBug(b, dt){
+  b.turnT -= dt;
+  if (b.turnT<=0){ b.dir += rand(-1,1); b.turnT = rand(0.6,2); }
+  b.x += Math.cos(b.dir)*b.speed*dt;
+  b.y += Math.sin(b.dir)*b.speed*dt*0.4;
+  b.x = clamp(b.x,0,W); b.y = clamp(b.y, H*0.7, H*0.99);
+  ctx.save();
+  ctx.translate(b.x,b.y);
+  ctx.rotate(b.dir);
+  ctx.fillStyle = 'rgba(25,20,15,0.8)';
+  ctx.beginPath(); ctx.ellipse(0,0,2.6,1.6,0,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+/* ============================================================
+   FALLING PETALS
+   ============================================================ */
+const fallingPetals = [];
+function spawnPetal(){
+  if (!flowers.length) return;
+  const f = pick(flowers.filter(f=>f.depth>0.35));
+  if (!f) return;
+  fallingPetals.push({
+    x: f.x + rand(-8,8), y: f.y-f.stemHeight,
+    vx: rand(-6,6), vy: rand(4,10),
+    rot: rand(0,Math.PI*2), rotV: rand(-1,1),
+    hue: f.hue, sat:f.sat, lig:f.lig,
+    life: rand(6,10)
+  });
+}
+function updateDrawPetal(p, dt){
+  p.life -= dt;
+  p.vx += Math.sin(windTime*1.3+p.x*0.01)*4*dt;
+  p.x += (p.vx + windStrength()*8)*dt;
+  p.y += p.vy*dt;
+  p.rot += p.rotV*dt;
+  ctx.save();
+  ctx.translate(p.x,p.y); ctx.rotate(p.rot);
+  ctx.globalAlpha = clamp(p.life/2,0,1);
+  ctx.fillStyle = `hsl(${p.hue}, ${p.sat}%, ${p.lig}%)`;
+  ctx.beginPath();
+  ctx.ellipse(0,0,4,2.4,0,0,Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+/* ============================================================
+   FLOATING SEEDS (dandelion-like)
+   ============================================================ */
+const seeds = [];
+function spawnSeed(){
+  seeds.push({ x: rand(0,W), y: rand(H*0.4,H*0.85), vy: rand(-6,-2), phase: rand(0,10), life: rand(10,16) });
+}
+function updateDrawSeed(sd, dt){
+  sd.life -= dt;
+  sd.phase += dt;
+  sd.x += (windStrength()*14 + Math.sin(sd.phase*1.7)*6)*dt;
+  sd.y += (sd.vy + Math.sin(sd.phase)*4)*dt;
+  ctx.save();
+  ctx.globalAlpha = clamp(sd.life/3,0,0.85);
+  ctx.translate(sd.x,sd.y);
+  ctx.strokeStyle='rgba(255,255,255,0.75)';
+  ctx.lineWidth=0.6;
+  for (let i=0;i<7;i++){
+    const a = (i/7)*Math.PI*2;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(Math.cos(a)*4,Math.sin(a)*4); ctx.stroke();
+  }
+  ctx.fillStyle='rgba(255,255,255,0.9)';
+  ctx.beginPath(); ctx.arc(0,0,1,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+/* ============================================================
+   DRY LEAVES (occasional)
+   ============================================================ */
+const dryLeaves = [];
+function spawnDryLeaf(){
+  dryLeaves.push({ x: rand(0,W), y: rand(-20,horizonY*0.6), vy: rand(10,20), rot: rand(0,7), rotV: rand(-1.5,1.5), life: rand(8,14) });
+}
+function updateDrawDryLeaf(l, dt){
+  l.life -= dt;
+  l.x += (windStrength()*18 + Math.sin(t*1.2+l.rot)*10)*dt;
+  l.y += l.vy*dt;
+  l.rot += l.rotV*dt;
+  ctx.save();
+  ctx.translate(l.x,l.y); ctx.rotate(l.rot);
+  ctx.fillStyle = 'rgba(150,105,55,0.85)';
+  ctx.beginPath();
+  ctx.moveTo(0,-6); ctx.quadraticCurveTo(6,0,0,7); ctx.quadraticCurveTo(-6,0,0,-6);
+  ctx.fill();
+  ctx.restore();
+}
+
+/* ============================================================
+   INIT
+   ============================================================ */
+function initScene(){
+  resize();
+  buildMountains();
+  buildTrees();
+  buildGrass();
+  buildFlowerField();
+  buildButterflies();
+  buildBees();
+  buildGroundBugs();
+}
+
+/* ============================================================
+   MAIN LOOP
+   ============================================================ */
+let last = performance.now();
+let petalTimer = 0, seedTimer = 0, leafTimer = 0;
+
+function frame(now){
+  const dt = Math.min(0.05, (now-last)/1000);
+  last = now;
+  t += dt;
+  updateWind(dt);
+  updateLight(dt);
+
+  // camera breathing
+  const breatheX = Math.sin(t*0.09)*2.2;
+  const breatheY = Math.cos(t*0.07)*1.4;
+  const breatheS = 1 + Math.sin(t*0.05)*0.004;
+
+  ctx.save();
+  ctx.translate(W/2,H/2);
+  ctx.scale(breatheS,breatheS);
+  ctx.translate(-W/2+breatheX, -H/2+breatheY);
+
+  drawSky();
+  drawMountains(breatheX*0.2);
+  drawTrees(breatheX*0.4);
+  drawGround();
+
+  // far flowers + grass first (depth<0.55), then near
+  const farFlowers = flowers.filter(f=>f.depth<0.55);
+  const nearFlowers = flowers.filter(f=>f.depth>=0.55);
+  const farGrass = grassBlades.filter(b=>b.depth<0.55);
+  const nearGrass = grassBlades.filter(b=>b.depth>=0.55);
+
+  farFlowers.forEach(f=>drawFlower(f,dt));
+  farGrass.forEach(drawGrassBlade);
+
+  // insects that live mid-ground
+  maybeSpawnDragonfly();
+  dragonflies = dragonflies.filter(d=>d.life>0 && d.x<W+40);
+  dragonflies.forEach(d=>updateDrawDragonfly(d,dt));
+
+  bees.forEach(b=>updateDrawBee(b,dt));
+  butterflies.forEach(b=>updateDrawButterfly(b,dt));
+
+  nearGrass.forEach(drawGrassBlade);
+  nearFlowers.forEach(f=>drawFlower(f,dt));
+
+  groundBugs.forEach(b=>updateDrawGroundBug(b,dt));
+
+  // particles
+  petalTimer -= dt; if (petalTimer<=0){ spawnPetal(); petalTimer = rand(1.2,2.6); }
+  seedTimer -= dt; if (seedTimer<=0){ spawnSeed(); seedTimer = rand(1.5,3); }
+  leafTimer -= dt; if (leafTimer<=0){ spawnDryLeaf(); leafTimer = rand(4,8); }
+
+  for (let i=fallingPetals.length-1;i>=0;i--){
+    const p = fallingPetals[i];
+    updateDrawPetal(p,dt);
+    if (p.life<=0 || p.y>H+10) fallingPetals.splice(i,1);
+  }
+  for (let i=seeds.length-1;i>=0;i--){
+    const s = seeds[i];
+    updateDrawSeed(s,dt);
+    if (s.life<=0 || s.x>W+40 || s.x<-40) seeds.splice(i,1);
+  }
+  for (let i=dryLeaves.length-1;i>=0;i--){
+    const l = dryLeaves[i];
+    updateDrawDryLeaf(l,dt);
+    if (l.life<=0 || l.y>H+20) dryLeaves.splice(i,1);
+  }
+
+  // gentle vignette for cinematic feel
+  const vg = ctx.createRadialGradient(W/2,H*0.55,H*0.25, W/2,H*0.55,H*0.85);
+  vg.addColorStop(0,'rgba(0,0,0,0)');
+  vg.addColorStop(1,'rgba(15,15,10,0.28)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0,0,W,H);
+
+  ctx.restore();
+
+  // keep flower array bounded (remove excess if user clicks a lot)
+  if (flowers.length > 260) flowers.splice(0, flowers.length-260);
+
+  requestAnimationFrame(frame);
+}
+
+initScene();
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
